@@ -8,6 +8,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -50,6 +52,18 @@ type Options struct {
 	// Verbose enables detailed logging of proxy operations.
 	// By default, logging is disabled.
 	Verbose bool
+
+	// Logger is a structured logger for the transport
+	Logger *slog.Logger
+
+	// MaxIdleConnsPerHost specifies the max idle connections per host
+	MaxIdleConnsPerHost int
+
+	// MinRetryBackoff specifies the minimum backoff duration
+	MinRetryBackoff time.Duration
+
+	// MaxRetryBackoff specifies the maximum backoff duration
+	MaxRetryBackoff time.Duration
 }
 
 // Transport implements http.RoundTripper interface with proxy rotation capabilities.
@@ -64,6 +78,7 @@ type Transport struct {
 	failedProxies      map[string]time.Time
 	verbose            bool
 	insecureSkipVerify bool
+	logger             *slog.Logger
 }
 
 // New creates a new ProxyCycle transport with given options.
@@ -115,6 +130,17 @@ func New(opts Options) (*Transport, error) {
 		failureDuration = 3 * time.Second
 	}
 
+	// Set default logger if none provided
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+
+	// Set default connection values
+	maxIdleConnsPerHost := opts.MaxIdleConnsPerHost
+	if maxIdleConnsPerHost <= 0 {
+		maxIdleConnsPerHost = 10
+	}
+
 	t := &Transport{
 		options: Options{
 			ProxyURLs:            opts.ProxyURLs,
@@ -123,29 +149,32 @@ func New(opts Options) (*Transport, error) {
 			RetryBackoff:         retryBackoff,
 			ProxyFailureDuration: failureDuration,
 			Verbose:              opts.Verbose,
+			Logger:               opts.Logger,
+			MaxIdleConnsPerHost:  maxIdleConnsPerHost,
 		},
 		proxies:            proxies,
 		failedProxies:      make(map[string]time.Time),
 		verbose:            opts.Verbose,
 		insecureSkipVerify: insecureSkipVerify,
-	}
-
-	// Initialize the base transport with default values
-	t.base = http.Transport{
-		Proxy: nil, // Will be set per request
-		DialContext: (&net.Dialer{
-			Timeout:   proxyTimeout,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: insecureSkipVerify,
+		logger:             opts.Logger,
+		base: http.Transport{
+			Proxy: nil, // Will be set per request
+			DialContext: (&net.Dialer{
+				Timeout:   proxyTimeout,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: insecureSkipVerify,
+			},
+			ForceAttemptHTTP2:      true,
+			MaxIdleConns:           100,
+			MaxIdleConnsPerHost:    maxIdleConnsPerHost,
+			IdleConnTimeout:        90 * time.Second,
+			TLSHandshakeTimeout:    10 * time.Second,
+			ExpectContinueTimeout:  1 * time.Second,
+			DisableKeepAlives:      false, // Enable keep-alives
+			ResponseHeaderTimeout:  30 * time.Second,
 		},
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		DisableKeepAlives:     true, // Disable keep-alives to avoid connection reuse issues
 	}
 
 	return t, nil
@@ -252,6 +281,32 @@ func isRetryableError(err error) bool {
 	return false
 }
 
+// calculateBackoff calculates the retry backoff with exponential increase and jitter
+func (t *Transport) calculateBackoff(attempt int) time.Duration {
+	minBackoff := t.options.MinRetryBackoff
+	if minBackoff <= 0 {
+		minBackoff = 100 * time.Millisecond
+	}
+	
+	maxBackoff := t.options.MaxRetryBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = 10 * time.Second
+	}
+
+	// Calculate exponential backoff
+	backoff := minBackoff * time.Duration(1<<uint(attempt))
+	if backoff > maxBackoff {
+		backoff = maxBackoff
+	}
+
+	// Add jitter (±20%)
+	jitterRange := float64(backoff) * 0.2
+	jitter := time.Duration(rand.Float64()*jitterRange - jitterRange/2)
+	backoff += jitter
+
+	return backoff
+}
+
 // RoundTrip implements the http.RoundTripper interface.
 // It executes the request using a proxy from the rotation pool,
 // automatically retrying with different proxies on failure.
@@ -265,75 +320,77 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	var lastErr error
-	origURL := *req.URL
 	origHost := req.Host
 	if origHost == "" {
 		origHost = req.URL.Host
 	}
 
+	startTime := time.Now()
 	currentProxy := t.nextProxy()
 
 	for attempt := 0; attempt <= t.options.MaxRetries; attempt++ {
-		select {
-		case <-req.Context().Done():
-			return nil, req.Context().Err()
-		default:
-		}
+		proxyURL := currentProxy.String()
+		
+		t.logger.Debug("attempting request",
+			"proxy", proxyURL,
+			"attempt", attempt+1,
+		)
 
-		if t.verbose {
-			fmt.Printf("proxycycle: attempt %d using proxy %s\n", attempt+1, currentProxy)
-		}
-
+		// Set up proxy for this attempt
 		t.base.Proxy = http.ProxyURL(currentProxy)
 
-		// Clone request to avoid modifying the original
+		// Clone request and set up context
 		reqCopy := req.Clone(req.Context())
-		reqCopy.URL = &origURL
-		reqCopy.Host = origHost
-
-		// Set timeout for this attempt
 		ctx, cancel := context.WithTimeout(reqCopy.Context(), t.options.ProxyTimeout)
 		reqCopy = reqCopy.WithContext(ctx)
 
 		resp, err := t.base.RoundTrip(reqCopy)
-		cancel() // Always cancel the timeout context
+		cancel()
 
-		// Check for context cancellation first
-		if req.Context().Err() != nil {
-			if resp != nil {
-				resp.Body.Close()
-			}
-			return nil, req.Context().Err()
-		}
-
+		// Handle response
 		if err != nil {
 			lastErr = err
 			if !isRetryableError(err) {
+				t.logger.Error("non-retryable error",
+					"proxy", proxyURL,
+					"error", err,
+				)
 				return nil, fmt.Errorf("proxycycle: non-retryable error: %w", err)
 			}
-			if t.verbose {
-				fmt.Printf("proxycycle: proxy error: %v\n", err)
-			}
+
+			t.logger.Warn("retryable error",
+				"proxy", proxyURL,
+				"error", err,
+			)
 			t.markProxyAsFailed(currentProxy)
 			currentProxy = t.nextProxy()
 		} else if isFailedResponse(resp) {
-			if t.verbose {
-				fmt.Printf("proxycycle: proxy failed with status %d\n", resp.StatusCode)
-			}
+			t.logger.Warn("proxy failed response",
+				"proxy", proxyURL,
+				"status", resp.StatusCode,
+			)
 			resp.Body.Close()
 			lastErr = fmt.Errorf("proxycycle: proxy returned status %d", resp.StatusCode)
 			t.markProxyAsFailed(currentProxy)
 			currentProxy = t.nextProxy()
 		} else {
-			if t.verbose {
-				fmt.Printf("proxycycle: request successful through proxy %s\n", currentProxy)
-			}
+			t.logger.Debug("request successful",
+				"proxy", proxyURL,
+				"duration", time.Since(startTime),
+			)
 			return resp, nil
 		}
 
-		// Wait before retry unless this was the last attempt
+		// Apply backoff if not the last attempt
 		if attempt < t.options.MaxRetries {
-			timer := time.NewTimer(t.options.RetryBackoff)
+			backoff := t.calculateBackoff(attempt)
+			timer := time.NewTimer(backoff)
+			
+			t.logger.Debug("applying retry backoff",
+				"backoff", backoff,
+				"attempt", attempt+1,
+			)
+
 			select {
 			case <-req.Context().Done():
 				timer.Stop()

@@ -2,7 +2,8 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -20,6 +21,9 @@ var (
 	proxyTimeout         time.Duration
 	proxyFailureDuration time.Duration
 	repeat               int
+	maxIdleConnsPerHost  int
+	minRetryBackoff      time.Duration
+	maxRetryBackoff      time.Duration
 )
 
 func main() {
@@ -33,13 +37,17 @@ with automatic retry and failure handling capabilities.`,
 		},
 	}
 
-	rootCmd.Flags().StringVarP(&proxyURLs, "proxies", "p", "", "Comma-separated list of proxy URLs")
+	rootCmd.Flags().StringVarP(&proxyURLs, "proxies", "p", "", "Comma-separated list of proxy URLs (with optional auth: http://user:pass@host:port)")
 	rootCmd.Flags().StringVarP(&targetURL, "url", "u", "http://ip-api.com/json", "Target URL to request")
 	rootCmd.Flags().IntVarP(&maxRetries, "retries", "r", 2, "Maximum number of retries per request")
 	rootCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose logging")
 	rootCmd.Flags().DurationVarP(&proxyTimeout, "timeout", "t", 5*time.Second, "Timeout for each proxy attempt")
 	rootCmd.Flags().DurationVarP(&proxyFailureDuration, "failure-duration", "f", 30*time.Second, "How long to mark a proxy as failed")
 	rootCmd.Flags().IntVarP(&repeat, "repeat", "n", 1, "Number of times to repeat the request")
+
+	rootCmd.Flags().IntVar(&maxIdleConnsPerHost, "max-idle-conns", 10, "Maximum number of idle connections per host")
+	rootCmd.Flags().DurationVar(&minRetryBackoff, "min-backoff", 100*time.Millisecond, "Minimum retry backoff duration")
+	rootCmd.Flags().DurationVar(&maxRetryBackoff, "max-backoff", 10*time.Second, "Maximum retry backoff duration")
 
 	rootCmd.MarkFlagRequired("proxies")
 
@@ -50,14 +58,29 @@ with automatic retry and failure handling capabilities.`,
 }
 
 func run() error {
+	var logHandler slog.Handler
+	if verbose {
+		logHandler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+		})
+	} else {
+		logHandler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		})
+	}
+	logger := slog.New(logHandler)
+
 	proxyList := strings.Split(proxyURLs, ",")
 
 	transport, err := proxycycle.New(proxycycle.Options{
 		ProxyURLs:            proxyList,
 		MaxRetries:           maxRetries,
-		Verbose:              verbose,
+		Logger:               logger,
 		ProxyTimeout:         proxyTimeout,
 		ProxyFailureDuration: proxyFailureDuration,
+		MaxIdleConnsPerHost:  maxIdleConnsPerHost,
+		MinRetryBackoff:      minRetryBackoff,
+		MaxRetryBackoff:      maxRetryBackoff,
 	})
 	if err != nil {
 		return fmt.Errorf("error creating transport: %v", err)
@@ -68,18 +91,28 @@ func run() error {
 	}
 
 	for i := 0; i < repeat; i++ {
+		logger.Info("making request", "attempt", i+1, "target", targetURL)
+
 		resp, err := client.Get(targetURL)
 		if err != nil {
 			return fmt.Errorf("error making request: %v", err)
 		}
-		defer resp.Body.Close()
 
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			return fmt.Errorf("error reading response: %v", err)
 		}
 
-		fmt.Printf("Response %d: %s\n", i+1, string(body))
+		logger.Info("request completed",
+			"attempt", i+1,
+			"status", resp.StatusCode,
+			"body_length", len(body),
+		)
+
+		if verbose {
+			fmt.Printf("Response %d: %s\n", i+1, string(body))
+		}
 	}
 
 	return nil
