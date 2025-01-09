@@ -10,16 +10,56 @@ ProxyCycle is a resilient HTTP transport implementation for Go that provides aut
 - ⏱️ Configurable timeouts and backoff strategies
 - 📝 Optional verbose logging
 - 🔒 Support for secure and insecure proxy configurations
+- 🖥️ Command-line interface (CLI)
 
 ## Installation
 
+### As a Package
 ```bash
 go get github.com/nguyenvanduocit/proxycycle
 ```
 
+### As a CLI Tool
+```bash
+go install github.com/nguyenvanduocit/proxycycle/cmd/proxycycle@latest
+```
+
 ## Usage
 
-Here's a simple example of how to use ProxyCycle:
+### CLI Usage
+
+The CLI tool provides a simple way to make HTTP requests through rotating proxies:
+
+```bash
+# Basic usage
+proxycycle --proxies "http://proxy1.com:8080,http://proxy2.com:8080" --url "https://api.example.com"
+
+# With all options
+proxycycle \
+  --proxies "http://proxy1.com:8080,http://proxy2.com:8080" \
+  --url "https://api.example.com" \
+  --retries 3 \
+  --timeout 5s \
+  --failure-duration 30s \
+  --repeat 5 \
+  --verbose
+
+# Show help
+proxycycle --help
+```
+
+Available CLI options:
+- `--proxies, -p`: Comma-separated list of proxy URLs (required)
+- `--url, -u`: Target URL to request (default: http://ip-api.com/json)
+- `--retries, -r`: Maximum number of retries per request (default: 2)
+- `--timeout, -t`: Timeout for each proxy attempt (default: 5s)
+- `--failure-duration, -f`: How long to mark a proxy as failed (default: 30s)
+- `--repeat, -n`: Number of times to repeat the request (default: 1)
+- `--verbose, -v`: Enable verbose logging
+
+### Package Usage
+
+Here's how to use ProxyCycle as a Go package:
 
 ```go
 package main
